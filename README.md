@@ -138,19 +138,15 @@ d2 candidate = 0x508042ff51c1752f580c82421046cc3a88119894d275e77c0ea2244cd12996c
 derived pub = 02417f85cce4b89b6cce102bc365f292fe1c7b4ec65fe64ff225cb020ed6b3fa21
 => MATCH FOUND!
 
-Done. Matches saved in matches.txt
+Done. Matches saved in matches.txt ```
 
 
-```
-```
+
 
 "AND IF YOU HAVE NOT YET COMPUTED THE PUBLIC KEY, JUST ADD ALL THREE TRANSACTION IDS, WHICH ALL USE THE SAME R VALUE, BUT WITH TWO HAVING THE SAME PUBLIC KEY AND ONE BEING DIFFERENT."
 
 
-```
-```
-
-vpk@DESKTOP-F18Q01U:~/vpk/rsz$ python3 rsz_tnx_solve.py
+```vpk@DESKTOP-F18Q01U:~/vpk/rsz$ python3 rsz_tnx_solve.py
 
 === ECDSA Nonce Reuse Auto Scanner (modified) ===
 
@@ -234,4 +230,5 @@ Privatekey FOUND: 0xc477f9f65c22cce20657faa5b2d1d8122336f851a508a1ed04e479c34985
 ------------------------------------------------------------------------------------------------------------------------
 Program Finished ...
 ```
+
 
