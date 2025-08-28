@@ -144,9 +144,9 @@ Done. Matches saved in matches.txt
 ```
 
 
-#"AND IF YOU HAVE NOT YET COMPUTED THE PRIVATE KEY, JUST ADD ALL THREE TRANSACTION IDS,
+**#"AND IF YOU HAVE NOT YET COMPUTED THE PRIVATE KEY, JUST ADD ALL THREE TRANSACTION IDS,
  WHICH ALL USE THE SAME R VALUE, BUT WITH TWO HAVING THE SAME PUBLIC KEY
- AND ONE BEING DIFFERENT."
+ AND ONE BEING DIFFERENT."**
 
 ```
 ```
@@ -270,9 +270,10 @@ Exiting gracefully...
 Program Finished ...
 ```
 
-Donations :-
+**##Donations :-**
 
-BTC: bc1q3etap222dq3c3r3xywucd88zg0dwlr4utv668m
+**BTC:** bc1q3etap222dq3c3r3xywucd88zg0dwlr4utv668m
+
 
 
 
