@@ -270,9 +270,10 @@ Exiting gracefully...
 Program Finished ...
 ```
 
-**##Donations :-**
+## Donations
 
 **BTC:** bc1q3etap222dq3c3r3xywucd88zg0dwlr4utv668m
+
 
 
 
