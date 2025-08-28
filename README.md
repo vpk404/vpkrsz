@@ -233,8 +233,39 @@ Duplicate R Found. Congrats!. (87, 95, '0400000000000000000000000000000000000000
 Privatekey FOUND: 0xc477f9f65c22cce20657faa5b2d1d8122336f851a508a1ed04e479c34985bf96
 ======================================================================
 ------------------------------------------------------------------------------------------------------------------------
+
+```
+
+
+PS C:\Users\vedpr\Desktop\Bitcoin-Vulnerability-Scanner> python .\rsz_add_adv.py
+Enter path to BTC addresses file (one per line): add.txt
+Max transactions per address (0 = no limit): 0
+
+CRYPTOGRAPHYTUBE Bitcoin Vulnerability Scanner (SAFE MODE, TXT only)
+Scan Time: 2025-08-28 11:08:45
+================================================================================
+Total Addresses: 1441
+Scanned Addresses: 13
+Vulnerable Addresses: 1 (7.7%)
+
+Vulnerabilities Found (counts):
+🔴 Reused Nonce: 1
+🔴 Weak RNG: 0
+🔴 Multi-Nonce Delta: 0
+🔴 K-Value Signals: 0
+================================================================================
+
+Currently Scanning: 18mxNASevBy3YpKSCRwoQ3ScsxzxohPXwr
+
+Recent Vulnerable Addresses:
+ - 152ermHcpemLTqdd5rvafJmEQDa6oiRr1B
+================================================================================
+
+Exiting gracefully...
+
 Program Finished ...
 ```
+
 
 
 
