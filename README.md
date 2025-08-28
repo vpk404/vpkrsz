@@ -236,6 +236,7 @@ Privatekey FOUND: 0xc477f9f65c22cce20657faa5b2d1d8122336f851a508a1ed04e479c34985
 
 ```
 
+```
 
 PS C:\Users\vedpr\Desktop\Bitcoin-Vulnerability-Scanner> python .\rsz_add_adv.py
 Enter path to BTC addresses file (one per line): add.txt
@@ -263,8 +264,12 @@ Recent Vulnerable Addresses:
 
 Exiting gracefully...
 
+```
+```
+
 Program Finished ...
 ```
+
 
 
 
