@@ -144,7 +144,9 @@ Done. Matches saved in matches.txt
 ```
 
 
-#"AND IF YOU HAVE NOT YET COMPUTED THE PUBLIC KEY, JUST ADD ALL THREE TRANSACTION IDS, WHICH ALL USE THE SAME R VALUE, BUT WITH TWO HAVING THE SAME PUBLIC KEY AND ONE BEING DIFFERENT."
+#"AND IF YOU HAVE NOT YET COMPUTED THE PRIVATE KEY, JUST ADD ALL THREE TRANSACTION IDS,
+ WHICH ALL USE THE SAME R VALUE, BUT WITH TWO HAVING THE SAME PUBLIC KEY
+ AND ONE BEING DIFFERENT."
 
 ```
 ```
@@ -233,6 +235,7 @@ Privatekey FOUND: 0xc477f9f65c22cce20657faa5b2d1d8122336f851a508a1ed04e479c34985
 ------------------------------------------------------------------------------------------------------------------------
 Program Finished ...
 ```
+
 
 
 
