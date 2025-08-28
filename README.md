@@ -238,7 +238,7 @@ Privatekey FOUND: 0xc477f9f65c22cce20657faa5b2d1d8122336f851a508a1ed04e479c34985
 
 ```
 
-PS C:\Users\vedpr\Desktop\Bitcoin-Vulnerability-Scanner> python .\rsz_add_adv.py
+PS C:\Users\vpk\Desktop\rsz> python .\rsz_add_adv.py
 Enter path to BTC addresses file (one per line): add.txt
 Max transactions per address (0 = no limit): 0
 
@@ -269,6 +269,7 @@ Exiting gracefully...
 
 Program Finished ...
 ```
+
 
 
 
