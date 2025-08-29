@@ -904,7 +904,7 @@ def analyze_address(address: str) -> Optional[Dict[str, Any]]:
     vulns: List[Dict[str, Any]] = []
 
     # ---------------- Vulnerability checks ----------------
-    # Reused nonce
+    # Reused nonce (हमेशा check होगा)
     reused = check_reused_nonce_global(address, sigs)
     if reused:
         vulns.extend(reused)
@@ -913,63 +913,70 @@ def analyze_address(address: str) -> Optional[Dict[str, Any]]:
     else:
         report["per_address_counts"]["Reused Nonce"] = 0
 
-    # Weak RNG
-    weak = check_weak_rng(sigs)
-    if weak:
-        vulns.append(weak)
-        VULN_COUNTS["Weak RNG"] += 1
-        report["per_address_counts"]["Weak RNG"] = 1
+    # ✅ बाकी checks सिर्फ तब होंगे जब -s flag दिया गया हो
+    if SAVE_KVALUE_FLAG:
+        # Weak RNG
+        weak = check_weak_rng(sigs)
+        if weak:
+            vulns.append(weak)
+            VULN_COUNTS["Weak RNG"] += 1
+            report["per_address_counts"]["Weak RNG"] = 1
+        else:
+            report["per_address_counts"]["Weak RNG"] = 0
+
+        # Multi-nonce delta
+        delta = check_multi_nonce_delta(sigs)
+        if delta:
+            vulns.append(delta)
+            VULN_COUNTS["Multi-Nonce Delta"] += 1
+            report["per_address_counts"]["Multi-Nonce Delta"] = 1
+        else:
+            report["per_address_counts"]["Multi-Nonce Delta"] = 0
+
+        # K-value signals
+        ksig = check_kvalue_signals(sigs)
+        if ksig:
+            vulns.append(ksig)
+            VULN_COUNTS["K-Value Signals"] += 1
+            report["per_address_counts"]["K-Value Signals"] = 1
+
+            # ✅ Collect r, s, z (original), txids
+            r_list = [item.get("r") for item in sigs if isinstance(item.get("r"), int)]
+            s_list = [item.get("s") for item in sigs if isinstance(item.get("s"), int)]
+            z_list = [item.get("z_original") for item in sigs if item.get("z_original") is not None]
+            txids = [item.get("txid") for item in sigs if item.get("txid")]
+            txids = list(dict.fromkeys(txids))  # unique txids
+
+            # Append consolidated
+            KVALUE_CONSOLIDATED.append({
+                "address": address,
+                "n": ksig.get("sample_size"),
+                "level": ksig.get("evidence_level"),
+                "bias": ksig.get("bias", 0.0),
+                "gcd": ksig.get("gcd"),
+                "notes": ksig.get("notes", []),
+                "deep": da,
+                "r_values": r_list,
+                "s_values": s_list,
+                "z_values": z_list,   # ✅ अब original z save होगा
+                "txids": txids
+            })
+
+            print(f"[info] K-Value appended for {address} "
+                  f"(level={ksig.get('evidence_level')}, n={ksig.get('sample_size')})")
+
+            # Save immediately if toggle is on
+            if SAVE_KVALUE_IMMEDIATE:
+                try:
+                    save_kvalue_consolidated()
+                except Exception as e:
+                    print(f"[error] save_kvalue_consolidated() failed: {e}")
+        else:
+            report["per_address_counts"]["K-Value Signals"] = 0
     else:
+        # जब -s नहीं होगा तो ये checks skip होंगे
         report["per_address_counts"]["Weak RNG"] = 0
-
-    # Multi-nonce delta
-    delta = check_multi_nonce_delta(sigs)
-    if delta:
-        vulns.append(delta)
-        VULN_COUNTS["Multi-Nonce Delta"] += 1
-        report["per_address_counts"]["Multi-Nonce Delta"] = 1
-    else:
         report["per_address_counts"]["Multi-Nonce Delta"] = 0
-
-    # K-value signals
-    ksig = check_kvalue_signals(sigs)
-    if ksig:
-        vulns.append(ksig)
-        VULN_COUNTS["K-Value Signals"] += 1
-        report["per_address_counts"]["K-Value Signals"] = 1
-
-        # ✅ Collect r, s, z (original), txids
-        r_list = [item.get("r") for item in sigs if isinstance(item.get("r"), int)]
-        s_list = [item.get("s") for item in sigs if isinstance(item.get("s"), int)]
-        z_list = [item.get("z_original") for item in sigs if item.get("z_original") is not None]
-        txids = [item.get("txid") for item in sigs if item.get("txid")]
-        txids = list(dict.fromkeys(txids))  # unique txids
-
-        # Append consolidated
-        KVALUE_CONSOLIDATED.append({
-            "address": address,
-            "n": ksig.get("sample_size"),
-            "level": ksig.get("evidence_level"),
-            "bias": ksig.get("bias", 0.0),
-            "gcd": ksig.get("gcd"),
-            "notes": ksig.get("notes", []),
-            "deep": da,
-            "r_values": r_list,
-            "s_values": s_list,
-            "z_values": z_list,   # ✅ अब original z save होगा
-            "txids": txids
-        })
-
-        print(f"[info] K-Value appended for {address} "
-              f"(level={ksig.get('evidence_level')}, n={ksig.get('sample_size')})")
-
-        # Save immediately if toggle is on
-        if SAVE_KVALUE_IMMEDIATE and SAVE_KVALUE_FLAG:
-            try:
-                save_kvalue_consolidated()
-            except Exception as e:
-                print(f"[error] save_kvalue_consolidated() failed: {e}")
-    else:
         report["per_address_counts"]["K-Value Signals"] = 0
 
     # ---------------- Mark vulnerable ----------------
@@ -978,13 +985,14 @@ def analyze_address(address: str) -> Optional[Dict[str, Any]]:
         report["vulnerabilities"] = vulns
 
     REPORTS.append(report)
-    if SAVE_KVALUE_FLAG:   # ✅ सिर्फ -s use होने पर save होगा
+
+    # ✅ सिर्फ -s flag होने पर ही save होंगे
+    if SAVE_KVALUE_FLAG:
         save_address_vulns(address, vulns)
 
-
-    # Save reports
+    # Save reports (reused nonce report हमेशा चलेगा)
     save_rnonce(vulns, address)
-    
+
     return report
 
 def get_input_file() -> str:
