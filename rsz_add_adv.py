@@ -1,4 +1,4 @@
-# btc_safe_scanner_txt_only_v3.py (updated for Medium K-Value + Deep K analysis + consolidated report)
+# rsz_add_adv.py (updated for Medium K-Value + Deep K analysis + consolidated report)
 
 import requests, time, os, sys, math, signal
 from hashlib import sha256
@@ -86,7 +86,7 @@ def clear():
 
 def display_stats():
     clear()
-    print("CRYPTOGRAPHYTUBE Bitcoin Vulnerability Scanner (SAFE MODE, TXT only)")
+    print("VPK Bitcoin RSZ Scanner")
     print(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*80)
     print(f"Total Addresses: {TOTAL_ADDRESSES}")
