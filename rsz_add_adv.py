@@ -1022,6 +1022,11 @@ def main():
             addresses = [ln.strip() for ln in f if ln.strip()]
         TOTAL_ADDRESSES = len(addresses)
 
+                # 🔹 Show advisory only once if -s is not used
+        if "-s" not in sys.argv:
+            print("\n👉 If you want to process Weak RNG, Multi-Nonce Delta and K-Value signals use -s\n")
+
+
         # ✅ -s flag check
         if "-s" in sys.argv:
             SAVE_KVALUE_FLAG = True
