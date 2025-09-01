@@ -142,6 +142,29 @@ def fetch_transactions_batch(address: str, offset: int, limit: int) -> Optional[
     print(f"[error] failed batch after {attempts} attempts (offset {offset})")
     return None
 
+def fetch_raw_transaction(txid: str) -> Optional[str]:
+    """Fetch the raw transaction hex from blockchain.info."""
+    attempts = 0
+    while attempts < MAX_RETRIES and not EXIT_FLAG:
+        try:
+            url = f"https://blockchain.info/rawtx/{txid}?format=hex"
+            r = SESSION.get(url, timeout=REQ_TIMEOUT)
+            if r.status_code == 200:
+                return r.text.strip()
+            if r.status_code in (429, 500, 502, 503, 504):
+                print(f"[rate/err {r.status_code}] waiting for txid {txid}…")
+                attempts += 1
+                backoff_sleep(attempts)
+            else:
+                attempts += 1
+                backoff_sleep(attempts)
+        except Exception as e:
+            print(f"[warn] fetch_raw_transaction for {txid}: {e}")
+            attempts += 1
+            backoff_sleep(attempts)
+    print(f"[error] failed to fetch raw tx after {attempts} attempts (txid {txid})")
+    return None
+
 def fetch_all_transactions(address: str) -> List[dict]:
     total = get_total_transactions(address)
     if total <= 0:
@@ -156,13 +179,26 @@ def fetch_all_transactions(address: str) -> List[dict]:
     while offset < total_to_fetch and not EXIT_FLAG:
         remaining = total_to_fetch - offset
         size = min(BATCH_SIZE, remaining)
-        print(f"Fetching {offset+1}-{offset+size} of {total_to_fetch}…")
+        print(f"Fetching batch {offset+1}-{offset+size} of {total_to_fetch}…")
         batch = fetch_transactions_batch(address, offset, size)
         if batch is None:
             time.sleep(1.0)
             continue
         if not batch:
             break
+        
+        # New loop to fetch raw data for each transaction in the batch
+        for tx in batch:
+            txid = tx.get("hash")
+            if txid:
+                # Removed the detailed txid print statement here
+                raw_hex = fetch_raw_transaction(txid)
+                if raw_hex:
+                    tx['raw'] = raw_hex
+                else:
+                    # You can keep this warning if you want to know about failed fetches
+                    print(f"  [warn] Could not get raw data for {txid}, skipping z-value computation for this tx.")
+
         out.extend(batch)
         offset += len(batch)
         if offset < total_to_fetch:
@@ -811,21 +847,21 @@ def save_kvalue_consolidated():
                         f.write(f"    - {nt}\n")
 
                 # r_values
-                r_vals = row.get("r_values", [])
-                f.write("  r_values (decimal) [count=%d]:\n" % len(r_vals))
-                for r in r_vals:
+                r_list = row.get("r_values", [])
+                f.write("  r_values (decimal) [count=%d]:\n" % len(r_list))
+                for r in r_list:
                     f.write(f"    {r}\n")
 
                 # s_values
-                s_vals = row.get("s_values", [])
-                f.write("  s_values (decimal) [count=%d]:\n" % len(s_vals))
-                for s in s_vals:
+                s_list = row.get("s_values", [])
+                f.write("  s_values (decimal) [count=%d]:\n" % len(s_list))
+                for s in s_list:
                     f.write(f"    {s}\n")
 
-                # z_values (always enforce)
-                z_vals = row.get("z_values", [])
-                f.write("  z_values (decimal) [count=%d]:\n" % len(z_vals))
-                for z in z_vals:
+                # z_values
+                z_list = row.get("z_values", [])
+                f.write("  z_values (decimal) [count=%d]:\n" % len(z_list))
+                for z in z_list:
                     f.write(f"    {z}\n")
 
                 # txids
@@ -833,6 +869,13 @@ def save_kvalue_consolidated():
                 f.write("  txids [count=%d]:\n" % len(txids))
                 for t in txids:
                     f.write(f"    {t}\n")
+                
+                # pubkey_values
+                pubkey_list = row.get("pubkey_values", [])
+                f.write("  pubkey_values (hex) [count=%d]:\n" % len(pubkey_list))
+                for pk in pubkey_list:
+                    f.write(f"    {pk}\n")
+
 
                 f.write("\n")
 
@@ -861,6 +904,37 @@ def save_cross_address_summary():
         for r_hex, occ in SAVED_R_GROUPS.items():
             f.write(f"r={r_hex}  occurrences={len(occ)}\n")
     print(f"[saved] cross-address summary → {path}")
+
+def save_address_vulns(address: str, vulns: List[Dict[str, Any]]):
+    if not vulns:
+        return
+    selected = [v for v in vulns if v["type"] in ("Weak RNG", "Multi-Nonce Delta")]
+    if not selected:
+        return
+
+    os.makedirs("reports", exist_ok=True)
+    path = os.path.join("reports", f"{address}_vulns.txt")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("="*80 + "\n")
+        f.write(f"Address: {address}\n")
+        f.write(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("="*80 + "\n\n")
+
+        for v in selected:
+            f.write(f"🔴 {v['type']}\n")
+            f.write("-"*80 + "\n")
+            if v["type"] == "Weak RNG":
+                f.write(f"Unique r: {v['unique_r']}/{v['total']}  (ratio={v['ratio']:.2f})\n")
+                f.write(f"Severity: {v.get('severity','')}\n")
+                f.write(f"Signal: {v['signal']}\n")
+            elif v["type"] == "Multi-Nonce Delta":
+                f.write(f"Unique deltas: {v['unique_deltas']}/{v['total_deltas']}  (ratio={v['ratio']:.2f})\n")
+                f.write(f"Severity: {v.get('severity','')}\n")
+                f.write(f"Signal: {v['signal']}\n")
+            f.write("\n")
+
+    print(f"[saved] {address} → {path}")
 
 # -------------------- Driver --------------------
 
@@ -913,70 +987,65 @@ def analyze_address(address: str) -> Optional[Dict[str, Any]]:
     else:
         report["per_address_counts"]["Reused Nonce"] = 0
 
-    # ✅ बाकी checks सिर्फ तब होंगे जब -s flag दिया गया हो
-    if SAVE_KVALUE_FLAG:
-        # Weak RNG
-        weak = check_weak_rng(sigs)
-        if weak:
-            vulns.append(weak)
-            VULN_COUNTS["Weak RNG"] += 1
-            report["per_address_counts"]["Weak RNG"] = 1
-        else:
-            report["per_address_counts"]["Weak RNG"] = 0
-
-        # Multi-nonce delta
-        delta = check_multi_nonce_delta(sigs)
-        if delta:
-            vulns.append(delta)
-            VULN_COUNTS["Multi-Nonce Delta"] += 1
-            report["per_address_counts"]["Multi-Nonce Delta"] = 1
-        else:
-            report["per_address_counts"]["Multi-Nonce Delta"] = 0
-
-        # K-value signals
-        ksig = check_kvalue_signals(sigs)
-        if ksig:
-            vulns.append(ksig)
-            VULN_COUNTS["K-Value Signals"] += 1
-            report["per_address_counts"]["K-Value Signals"] = 1
-
-            # ✅ Collect r, s, z (original), txids
-            r_list = [item.get("r") for item in sigs if isinstance(item.get("r"), int)]
-            s_list = [item.get("s") for item in sigs if isinstance(item.get("s"), int)]
-            z_list = [item.get("z_original") for item in sigs if item.get("z_original") is not None]
-            txids = [item.get("txid") for item in sigs if item.get("txid")]
-            txids = list(dict.fromkeys(txids))  # unique txids
-
-            # Append consolidated
-            KVALUE_CONSOLIDATED.append({
-                "address": address,
-                "n": ksig.get("sample_size"),
-                "level": ksig.get("evidence_level"),
-                "bias": ksig.get("bias", 0.0),
-                "gcd": ksig.get("gcd"),
-                "notes": ksig.get("notes", []),
-                "deep": da,
-                "r_values": r_list,
-                "s_values": s_list,
-                "z_values": z_list,   # ✅ अब original z save होगा
-                "txids": txids
-            })
-
-            print(f"[info] K-Value appended for {address} "
-                  f"(level={ksig.get('evidence_level')}, n={ksig.get('sample_size')})")
-
-            # Save immediately if toggle is on
-            if SAVE_KVALUE_IMMEDIATE:
-                try:
-                    save_kvalue_consolidated()
-                except Exception as e:
-                    print(f"[error] save_kvalue_consolidated() failed: {e}")
-        else:
-            report["per_address_counts"]["K-Value Signals"] = 0
+    # Weak RNG
+    weak = check_weak_rng(sigs)
+    if weak:
+        vulns.append(weak)
+        VULN_COUNTS["Weak RNG"] += 1
+        report["per_address_counts"]["Weak RNG"] = 1
     else:
-        # जब -s नहीं होगा तो ये checks skip होंगे
         report["per_address_counts"]["Weak RNG"] = 0
+
+    # Multi-nonce delta
+    delta = check_multi_nonce_delta(sigs)
+    if delta:
+        vulns.append(delta)
+        VULN_COUNTS["Multi-Nonce Delta"] += 1
+        report["per_address_counts"]["Multi-Nonce Delta"] = 1
+    else:
         report["per_address_counts"]["Multi-Nonce Delta"] = 0
+
+    # K-value signals
+    ksig = check_kvalue_signals(sigs)
+    if ksig:
+        vulns.append(ksig)
+        VULN_COUNTS["K-Value Signals"] += 1
+        report["per_address_counts"]["K-Value Signals"] = 1
+
+        # ✅ Collect r, s, z (original), txids, and pubkeys
+        r_list = [item.get("r") for item in sigs if isinstance(item.get("r"), int)]
+        s_list = [item.get("s") for item in sigs if isinstance(item.get("s"), int)]
+        z_list = [item.get("z_original") for item in sigs if item.get("z_original") is not None]
+        txids = [item.get("txid") for item in sigs if item.get("txid")]
+        txids = list(dict.fromkeys(txids))  # unique txids
+        pubkey_list = [item.get("pubkey") for item in sigs if item.get("pubkey") is not None]
+
+        # Append consolidated
+        KVALUE_CONSOLIDATED.append({
+            "address": address,
+            "n": ksig.get("sample_size"),
+            "level": ksig.get("evidence_level"),
+            "bias": ksig.get("bias", 0.0),
+            "gcd": ksig.get("gcd"),
+            "notes": ksig.get("notes", []),
+            "deep": da,
+            "r_values": r_list,
+            "s_values": s_list,
+            "z_values": z_list,   
+            "txids": txids,
+            "pubkey_values": pubkey_list  # ✅ public key save होगा
+        })
+
+        print(f"[info] K-Value appended for {address} "
+              f"(level={ksig.get('evidence_level')}, n={ksig.get('sample_size')})")
+
+        # Save immediately if toggle is on
+        if SAVE_KVALUE_IMMEDIATE:
+            try:
+                save_kvalue_consolidated()
+            except Exception as e:
+                print(f"[error] save_kvalue_consolidated() failed: {e}")
+    else:
         report["per_address_counts"]["K-Value Signals"] = 0
 
     # ---------------- Mark vulnerable ----------------
@@ -986,12 +1055,9 @@ def analyze_address(address: str) -> Optional[Dict[str, Any]]:
 
     REPORTS.append(report)
 
-    # ✅ सिर्फ -s flag होने पर ही save होंगे
-    if SAVE_KVALUE_FLAG:
-        save_address_vulns(address, vulns)
-
     # Save reports (reused nonce report हमेशा चलेगा)
     save_rnonce(vulns, address)
+    save_address_vulns(address, vulns)
 
     return report
 
@@ -1022,22 +1088,16 @@ def main():
             addresses = [ln.strip() for ln in f if ln.strip()]
         TOTAL_ADDRESSES = len(addresses)
 
-                # 🔹 Show advisory only once if -s is not used
-        if "-s" not in sys.argv:
-            print("\n👉 If you want to process Weak RNG, Multi-Nonce Delta and K-Value signals use -s\n")
-
-
-        # ✅ -s flag check
-        if "-s" in sys.argv:
-            SAVE_KVALUE_FLAG = True
+        print("\nAll transaction data will be fetched for all checks (K-Value, Reused Nonce, etc.).")
+        
+        SAVE_KVALUE_FLAG = True
 
         for addr in addresses:
             if EXIT_FLAG:
                 break
             analyze_address(addr)
 
-        # ✅ kvalue.txt सिर्फ तब save होगा जब -s दिया गया हो
-        if not EXIT_FLAG and SAVE_KVALUE_FLAG:
+        if not EXIT_FLAG:
             save_kvalue_consolidated()
 
         if not EXIT_FLAG:
@@ -1047,10 +1107,7 @@ def main():
             for rep in REPORTS:
                 if rep.get("vulnerabilities"):
                     print(f" - {rep['address']}")
-            if SAVE_KVALUE_FLAG:
-                print("\nTXT reports saved in 'report/rnonce.txt' and consolidated K-Value in 'report/kvalue.txt'.")
-            else:
-                print("\nTXT reports saved in 'report/rnonce.txt' only.")
+            print("\nTXT reports saved in 'report/rnonce.txt', 'reports/[address]_vulns.txt', and consolidated K-Value in 'report/kvalue.txt'.")
     except KeyboardInterrupt:
         sys.exit(0)
 
