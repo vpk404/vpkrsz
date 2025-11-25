@@ -1,35 +1,19 @@
-# rsz_add_adv.py (updated for Medium K-Value + Deep K analysis + consolidated report)
+# rsz_add_adv.py (added SegWit BIP-143 sighash support + fixed varint)
 
 import requests, time, os, sys, math, signal
 from hashlib import sha256
-from collections import defaultdict, Counter
+from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 # -------------------- Config --------------------
-BLOCKCHAIN_API = "https://blockchain.info/address/{address}?format=json&offset={offset}&limit={limit}"
+MEMPOOL_API_TXS = "https://mempool.space/api/address/{address}/txs?limit={limit}&offset={offset}"
 N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141  # secp256k1 order
 
-# Evidence policy
-KVALUE_MIN_SIGS_STRONG = 20
-KVALUE_MIN_SIGS_MEDIUM = 12
-KVALUE_BIAS_THRESHOLD_STRONG = 0.30
-KVALUE_BIAS_THRESHOLD_MEDIUM = 0.18
-SAVE_KVALUE_LEVELS = {"strong", "medium"}  # <= changed: allow medium too
-
-# Save policy for "only K-Value" case (backward-compat)
-MIN_SIGS_FOR_KVALUE_SAVE = KVALUE_MIN_SIGS_STRONG  # kept, but we’ll gate with new logic too
-
-# RNG heuristics (medium/strong gates)
-WEAK_R_RATIO_STRONG = 0.60
-WEAK_R_RATIO_MEDIUM = 0.70
-DELTA_RATIO_STRONG = 0.35
-DELTA_RATIO_MEDIUM = 0.45
-
 # fetch tuning
-BATCH_SIZE = 100
+BATCH_SIZE = 25
 REQ_TIMEOUT = 20
-MAX_RETRIES = 5
+MAX_RETRIES = 10  # increased retries
 
 # -------------------- Globals --------------------
 
@@ -43,31 +27,13 @@ EXIT_FLAG = False
 REPORTS: List[Dict[str, Any]] = []
 MAX_TRANSACTIONS = 0  # 0 => no limit
 
-# Global r map and saved groups
+# Global r map
 GLOBAL_R_MAP: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
 SAVED_R_GROUPS: Dict[str, List[str]] = defaultdict(list)
-SAVE_KVALUE_FLAG = False
 
-# HTTP session for blockchain.info API
+# HTTP session for mempool.space API
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "SafeBTCScanner-TXT/1.5-kvalue-medium"})
-
-# Accumulator for consolidated K-Value report
-# Each element is dict: {
-#   "address": str,
-#   "n": int,
-#   "level": str,
-#   "bias": float,
-#   "gcd": int|None,
-#   "notes": list[str],
-#   "deep": dict,
-#   "s_values": list[int]
-# }
-KVALUE_CONSOLIDATED: List[Dict[str, Any]] = []
-
-# If True, save_kvalue_consolidated() will be called immediately after
-# each K-Value is appended (safer if program interrupted)
-SAVE_KVALUE_IMMEDIATE = True
+SESSION.headers.update({"User-Agent": "SafeBTCScanner-Mempool/1.5-reused-only"})
 
 # -------------------- Signals/UI --------------------
 def signal_handler(sig, frame):
@@ -94,8 +60,7 @@ def display_stats():
     percent = (VULNERABLE_ADDRESSES / SCANNED_ADDRESSES * 100) if SCANNED_ADDRESSES > 0 else 0.0
     print(f"Vulnerable Addresses: {VULNERABLE_ADDRESSES} ({percent:.1f}%)")
     print("\nVulnerabilities Found (counts):")
-    for key in ["Reused Nonce", "Weak RNG", "Multi-Nonce Delta", "K-Value Signals"]:
-        print(f"🔴 {key}: {VULN_COUNTS[key]}")
+    print(f"🔴 Reused Nonce: {VULN_COUNTS['Reused Nonce']}")
     print("="*80)
     print(f"\nCurrently Scanning: {CURRENT_ADDRESS}")
     vuln_addrs = [r['address'] for r in REPORTS if r.get('vulnerabilities')]
@@ -105,123 +70,130 @@ def display_stats():
     print("="*80)
 
 def backoff_sleep(attempt: int):
-    delay = min(2 ** attempt, 30)
-    time.sleep(delay + (0.25 * attempt))
+    delay = min(2 ** attempt * 3, 120)  # longer backoff with multiplier 3
+    print(f"[backoff] Sleeping {delay:.1f}s (attempt {attempt})")
+    time.sleep(delay)
 
 # -------------------- Networking --------------------
-def get_total_transactions(address: str) -> int:
-    try:
-        url = f"https://blockchain.info/address/{address}?format=json"
-        r = SESSION.get(url, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            return int(data.get('n_tx', 0))
-    except Exception as e:
-        print(f"[warn] get_total_transactions({address}) -> {e}")
-    return 0
+def get_total_transactions(address: str) -> Optional[int]:
+    attempts = 0
+    while attempts < MAX_RETRIES and not EXIT_FLAG:
+        try:
+            url = f"https://mempool.space/api/address/{address}"
+            r = SESSION.get(url, timeout=REQ_TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("chain_stats", {}).get("tx_count", 0)
+            elif r.status_code == 429:
+                print(f"[rate limit] Total tx for {address}, retrying...")
+                attempts += 1
+                backoff_sleep(attempts)
+            else:
+                attempts += 1
+                time.sleep(2)  # increased sleep
+        except Exception as e:
+            print(f"[warn] get_total_transactions({address}) attempt {attempts+1}: {e}")
+            attempts += 1
+            time.sleep(2)
+    print(f"[error] Failed to get total tx for {address} after {MAX_RETRIES} attempts")
+    return None
 
 def fetch_transactions_batch(address: str, offset: int, limit: int) -> Optional[List[dict]]:
     attempts = 0
     while attempts < MAX_RETRIES and not EXIT_FLAG:
         try:
-            url = BLOCKCHAIN_API.format(address=address, offset=offset, limit=limit)
+            url = MEMPOOL_API_TXS.format(address=address, offset=offset, limit=limit)
             r = SESSION.get(url, timeout=REQ_TIMEOUT)
             if r.status_code == 200:
-                return r.json().get('txs', [])
-            if r.status_code in (429, 500, 502, 503, 504):
-                print(f"[rate/err {r.status_code}] waiting…")
+                return r.json()
+            elif r.status_code == 429:
+                print(f"[rate limit] Batch offset {offset} for {address}, retrying...")
+                attempts += 1
+                backoff_sleep(attempts)
+            elif r.status_code in (500, 502, 503, 504):
+                print(f"[server err {r.status_code}] Batch offset {offset} for {address}, retrying...")
                 attempts += 1
                 backoff_sleep(attempts)
             else:
+                print(f"[http {r.status_code}] Batch offset {offset} for {address}, retrying...")
                 attempts += 1
-                backoff_sleep(attempts)
+                time.sleep(2)  # increased sleep
         except Exception as e:
-            print(f"[warn] batch offset {offset}: {e}")
+            print(f"[warn] batch offset {offset} for {address} attempt {attempts+1}: {e}")
             attempts += 1
-            backoff_sleep(attempts)
-    print(f"[error] failed batch after {attempts} attempts (offset {offset})")
+            time.sleep(2)
+    print(f"[error] failed batch after {MAX_RETRIES} attempts (offset {offset}) for {address}")
     return None
 
-def fetch_raw_transaction(txid: str) -> Optional[str]:
-    """Fetch the raw transaction hex from blockchain.info."""
-    attempts = 0
-    while attempts < MAX_RETRIES and not EXIT_FLAG:
-        try:
-            url = f"https://blockchain.info/rawtx/{txid}?format=hex"
-            r = SESSION.get(url, timeout=REQ_TIMEOUT)
-            if r.status_code == 200:
-                return r.text.strip()
-            if r.status_code in (429, 500, 502, 503, 504):
-                print(f"[rate/err {r.status_code}] waiting for txid {txid}…")
-                attempts += 1
-                backoff_sleep(attempts)
+def fetch_all_transactions(address: str, max_retries: int = 3) -> List[dict]:
+    for retry in range(max_retries):
+        total = get_total_transactions(address)
+        if total is None:
+            if retry < max_retries - 1:
+                print(f"[retry {retry+1}] Retrying total tx fetch for {address}")
+                time.sleep(10)  # increased delay
+                continue
             else:
-                attempts += 1
-                backoff_sleep(attempts)
-        except Exception as e:
-            print(f"[warn] fetch_raw_transaction for {txid}: {e}")
-            attempts += 1
-            backoff_sleep(attempts)
-    print(f"[error] failed to fetch raw tx after {attempts} attempts (txid {txid})")
-    return None
+                print(f"[fatal] Cannot get total tx for {address}, skipping")
+                return []
 
-def fetch_all_transactions(address: str) -> List[dict]:
-    total = get_total_transactions(address)
-    if total <= 0:
-        return []
-    print(f"\nAddress {address} has {total} total transactions")
+        if total <= 0:
+            return []
 
-    total_to_fetch = min(total, MAX_TRANSACTIONS) if MAX_TRANSACTIONS > 0 else total
-    print(f"Fetching {total_to_fetch} transactions…")
+        print(f"\nAddress {address} has {total} total transactions")
 
-    out: List[dict] = []
-    offset = 0
-    while offset < total_to_fetch and not EXIT_FLAG:
-        remaining = total_to_fetch - offset
-        size = min(BATCH_SIZE, remaining)
-        print(f"Fetching batch {offset+1}-{offset+size} of {total_to_fetch}…")
-        batch = fetch_transactions_batch(address, offset, size)
-        if batch is None:
-            time.sleep(1.0)
-            continue
-        if not batch:
-            break
-        
-        # New loop to fetch raw data for each transaction in the batch
-        for tx in batch:
-            txid = tx.get("hash")
-            if txid:
-                # Removed the detailed txid print statement here
-                raw_hex = fetch_raw_transaction(txid)
-                if raw_hex:
-                    tx['raw'] = raw_hex
-                else:
-                    # You can keep this warning if you want to know about failed fetches
-                    print(f"  [warn] Could not get raw data for {txid}, skipping z-value computation for this tx.")
+        total_to_fetch = min(total, MAX_TRANSACTIONS) if MAX_TRANSACTIONS > 0 else total
+        print(f"Fetching {total_to_fetch} transactions (attempt {retry+1})…")
 
-        out.extend(batch)
-        offset += len(batch)
-        if offset < total_to_fetch:
-            time.sleep(0.3)
-    return out
+        out: List[dict] = []
+        offset = 0
+        failed_batches = 0
+        while offset < total_to_fetch and not EXIT_FLAG:
+            remaining = total_to_fetch - offset
+            size = min(BATCH_SIZE, remaining)
+            print(f"Fetching batch {offset+1}-{offset+size} of {total_to_fetch}…")
+            batch = fetch_transactions_batch(address, offset, size)
+            if batch is None:
+                failed_batches += 1
+                print(f"[warn] Batch failed, sleeping 5s")  # increased sleep
+                time.sleep(5)
+                continue
+            if not batch:
+                break
+            out.extend(batch)
+            offset += len(batch)
+            if offset < total_to_fetch:
+                time.sleep(1.5)  # increased delay between batches
+
+        if len(out) > 0:
+            print(f"Successfully fetched {len(out)} txs for {address}")
+            return out
+        else:
+            print(f"[warn] No txs fetched for {address} (attempt {retry+1}), retrying...")
+            if retry < max_retries - 1:
+                time.sleep(20)  # longer delay before full retry
+                continue
+
+    print(f"[fatal] Failed to fetch any txs for {address} after {max_retries} attempts, skipping")
+    return []
 
 # -------------------- ScriptSig parsing --------------------
-def parse_der_sig_from_scriptsig(script_hex: str) -> Optional[Tuple[int, int, int]]:
+def parse_der_sig_from_hex(sig_hex: str) -> Optional[Tuple[int, int, int]]:
     try:
-        i = script_hex.find("30")
+        i = sig_hex.find("30")
         if i == -1:
             return None
         i0 = i + 2
-        _seq_len = int(script_hex[i0:i0+2], 16); i0 += 2
-        if script_hex[i0:i0+2] != "02": return None
+        _seq_len = int(sig_hex[i0:i0+2], 16); i0 += 2
+        if sig_hex[i0:i0+2] != "02": return None
         i0 += 2
-        r_len = int(script_hex[i0:i0+2], 16); i0 += 2
-        r_hex = script_hex[i0:i0 + 2*r_len]; i0 += 2*r_len
-        if script_hex[i0:i0+2] != "02": return None
+        r_len = int(sig_hex[i0:i0+2], 16); i0 += 2
+        r_hex = sig_hex[i0:i0 + 2*r_len]; i0 += 2*r_len
+        if sig_hex[i0:i0+2] != "02": return None
         i0 += 2
-        s_len = int(script_hex[i0:i0+2], 16); i0 += 2
-        s_hex = script_hex[i0:i0 + 2*s_len]; i0 += 2*s_len
-        sighash_hex = script_hex[i0:i0+2]
+        s_len = int(sig_hex[i0:i0+2], 16); i0 += 2
+        s_hex = sig_hex[i0:i0 + 2*s_len]; i0 += 2*s_len
+        sighash_hex = sig_hex[i0:i0+2]
         sighash_flag = int(sighash_hex, 16) if sighash_hex else 1
         r = int(r_hex, 16); s = int(s_hex, 16)
         return (r, s, sighash_flag)
@@ -242,94 +214,234 @@ def extract_pubkey_from_scriptsig(script_hex: str) -> Optional[str]:
     return candidates[-1][1]
 
 # -------------------- SIGHASH / preimage helpers --------------------
-def compute_sighash_z(tx: dict, vin_idx: int, sighash_flag: int) -> Optional[int]:
-    """
-    Compute real ECDSA message hash (z) for tx input vin_idx.
-    Returns integer z or None if not possible (missing data).
-    Supports:
-      - Legacy (non-segwit) SIGHASH_ALL
-      - BIP-143 (P2WPKH/P2WSH) if prev_out has script+value
-    """
+def varint(n: int) -> bytes:
+    """Bitcoin varint serialization."""
+    if n < 0xfd:
+        return n.to_bytes(1, 'little')
+    elif n <= 0xffff:
+        return b'\xfd' + n.to_bytes(2, 'little')
+    elif n <= 0xffffffff:
+        return b'\xfe' + n.to_bytes(4, 'little')
+    else:
+        return b'\xff' + n.to_bytes(8, 'little')
+
+def compute_legacy_sighash(tx: dict, vin_idx: int, sighash_flag: int) -> Optional[int]:
     try:
         from hashlib import sha256
 
         def dsha(b: bytes) -> bytes:
             return sha256(sha256(b).digest()).digest()
 
-        # simplified example: only handles SIGHASH_ALL legacy
-        vin = tx["inputs"][vin_idx]
-        prev = vin.get("prev_out", {})
-        script_pubkey = prev.get("script")
-        if not script_pubkey:
-            return None
-
-        version = int(tx.get("ver", 1))
-        locktime = int(tx.get("lock_time", 0))
+        version = int(tx.get("version", 1))
+        locktime = int(tx.get("locktime", 0))
         ser = version.to_bytes(4, "little")
 
         # inputs
-        ser += (len(tx["inputs"])).to_bytes(1, "little")
-        for i, inp in enumerate(tx["inputs"]):
-            prev_txid = inp["prev_out"]["hash"] if "hash" in inp["prev_out"] else inp["prev_out"]["txid"]
-            vout = int(inp["prev_out"]["n"])
-            ser += bytes.fromhex(prev_txid)[::-1]
-            ser += vout.to_bytes(4, "little")
+        vins = tx.get("vin", [])
+        input_count = len(vins)
+        ser += varint(input_count)
+        for i, inp in enumerate(vins):
+            prev_txid = inp.get("txid", "")
+            if not prev_txid:
+                return None
+            prev_txid_bytes = bytes.fromhex(prev_txid)[::-1]
+            vout_n = int(inp.get("vout", 0))
+            ser += prev_txid_bytes
+            ser += vout_n.to_bytes(4, "little")
             if i == vin_idx:
+                prevout = inp.get("prevout", {})
+                script_pubkey = prevout.get("scriptpubkey", "")
+                if not script_pubkey:
+                    return None
                 script_bytes = bytes.fromhex(script_pubkey)
-                ser += len(script_bytes).to_bytes(1, "little") + script_bytes
+                script_len = len(script_bytes)
+                ser += varint(script_len) + script_bytes
             else:
                 ser += b"\x00"
-            ser += (inp.get("sequence", 0xffffffff)).to_bytes(4, "little")
+            sequence = int(inp.get("sequence", 0xffffffff))
+            ser += sequence.to_bytes(4, "little")
 
         # outputs
-        ser += (len(tx["out"])).to_bytes(1, "little")
-        for out in tx["out"]:
-            ser += int(out["value"]).to_bytes(8, "little")
-            script_bytes = bytes.fromhex(out["script"])
-            ser += len(script_bytes).to_bytes(1, "little") + script_bytes
+        vouts = tx.get("vout", [])
+        output_count = len(vouts)
+        ser += varint(output_count)
+        for out in vouts:
+            value = int(out.get("value", 0))
+            ser += value.to_bytes(8, "little")
+            scriptpubkey = out.get("scriptpubkey", "")
+            script_bytes = bytes.fromhex(scriptpubkey)
+            script_len = len(script_bytes)
+            ser += varint(script_len) + script_bytes
 
         ser += locktime.to_bytes(4, "little")
         ser += sighash_flag.to_bytes(4, "little")
 
         return int.from_bytes(dsha(ser), "big")
-    except Exception:
+    except Exception as e:
+        print(f"[warn] compute_legacy_sighash error: {e}")
         return None
 
+def compute_bip143_sighash(tx: dict, vin_idx: int, sighash_flag: int) -> Optional[int]:
+    try:
+        from hashlib import sha256
+
+        def dsha(b: bytes) -> bytes:
+            return sha256(sha256(b).digest()).digest()
+
+        vins = tx.get("vin", [])
+        txin = vins[vin_idx]
+        prevout = txin.get("prevout", {})
+        input_type = prevout.get("type", "unknown")
+
+        if input_type not in ["p2wpkh", "p2sh-p2wpkh"]:
+            print(f"[warn] Unsupported BIP143 type: {input_type}")
+            return None
+
+        version = int(tx.get("version", 2))
+        locktime = int(tx.get("locktime", 0))
+
+        # hashPrevouts
+        prevouts_ser = b""
+        for inp in vins:
+            prev_txid_bytes = bytes.fromhex(inp.get("txid", ""))[::-1]
+            vout_n = int(inp.get("vout", 0))
+            prevouts_ser += prev_txid_bytes + vout_n.to_bytes(4, "little")
+        hashPrevouts = dsha(prevouts_ser)
+
+        # hashSequence
+        sequences_ser = b""
+        for inp in vins:
+            sequence = int(inp.get("sequence", 0xffffffff))
+            sequences_ser += sequence.to_bytes(4, "little")
+        hashSequence = dsha(sequences_ser)
+
+        # hashOutputs
+        outputs_ser = b""
+        for out in tx.get("vout", []):
+            value = int(out.get("value", 0))
+            outputs_ser += value.to_bytes(8, "little")
+            scriptpubkey = out.get("scriptpubkey", "")
+            script_bytes = bytes.fromhex(scriptpubkey)
+            script_len = len(script_bytes)
+            outputs_ser += varint(script_len) + script_bytes
+        hashOutputs = dsha(outputs_ser)
+
+        # outpoint
+        outpoint = bytes.fromhex(txin.get("txid", ""))[::-1] + int(txin.get("vout", 0)).to_bytes(4, "little")
+
+        # scriptCode
+        if input_type == "p2wpkh":
+            spk_hex = prevout.get("scriptpubkey", "")
+            spk_bytes = bytes.fromhex(spk_hex)
+            if len(spk_bytes) != 22 or spk_bytes[:2] != b'\x00\x14':
+                return None
+            hash160 = spk_bytes[2:]
+        elif input_type == "p2sh-p2wpkh":
+            scriptsig = txin.get("scriptsig", {})
+            sigscript_hex = scriptsig.get("hex", "") if isinstance(scriptsig, dict) else ""
+            if not sigscript_hex:
+                return None
+            # sigscript_hex starts with push len (16 for 22 bytes) + 0014{20 bytes hex}
+            if len(sigscript_hex) != 44:  # 2 + 40
+                return None
+            push_len_hex = sigscript_hex[:2]
+            if int(push_len_hex, 16) != 22:
+                return None
+            redeem_hex = sigscript_hex[2:]
+            redeem_bytes = bytes.fromhex(redeem_hex)
+            if len(redeem_bytes) != 22 or redeem_bytes[:2] != b'\x00\x14':
+                return None
+            hash160 = redeem_bytes[2:]
+        else:
+            return None
+
+        scriptCode = b"\x76\xa9\x14" + hash160 + b"\x88\xac"
+
+        value = int(prevout.get("value", 0)).to_bytes(8, "little")
+        sequence = int(txin.get("sequence", 0xffffffff)).to_bytes(4, "little")
+
+        preimage = (
+            version.to_bytes(4, "little") +
+            hashPrevouts +
+            hashSequence +
+            outpoint +
+            scriptCode +
+            value +
+            sequence +
+            hashOutputs +
+            locktime.to_bytes(4, "little") +
+            sighash_flag.to_bytes(4, "little")
+        )
+
+        return int.from_bytes(dsha(preimage), "big")
+    except Exception as e:
+        print(f"[warn] compute_bip143_sighash error: {e}")
+        return None
+
+def compute_sighash_z(tx: dict, vin_idx: int, sighash_flag: int) -> Optional[int]:
+    """
+    Compute real ECDSA message hash (z) for tx input vin_idx.
+    Supports legacy and BIP-143 (P2WPKH/P2SH-P2WPKH).
+    """
+    try:
+        if sighash_flag != 1:
+            print(f"[warn] Non-SIGHASH_ALL ({sighash_flag}), skipping z computation")
+            return None
+
+        vins = tx.get("vin", [])
+        if vin_idx >= len(vins):
+            return None
+        txin = vins[vin_idx]
+        prevout = txin.get("prevout", {})
+        input_type = prevout.get("type", "unknown")
+
+        if input_type in ["p2wpkh", "p2sh-p2wpkh"]:
+            return compute_bip143_sighash(tx, vin_idx, sighash_flag)
+        else:
+            # legacy (p2pkh, etc.)
+            return compute_legacy_sighash(tx, vin_idx, sighash_flag)
+    except Exception as e:
+        print(f"[warn] compute_sighash_z error: {e}")
+        return None
 
 def extract_signatures(transactions: List[dict]) -> List[Dict[str, Any]]:
     """
-    Extract r, s, pubkey, sighash, and compute original z (message hash) 
-    from raw transaction data.
+    Extract r, s, pubkey, sighash, and compute original z (message hash)
+    from transaction data. Supports legacy and SegWit (P2WPKH/P2SH-P2WPKH).
     """
     sigs = []
     for tx in transactions:
         try:
-            txid = tx.get("hash", "")
-            inputs = tx.get("inputs", [])
+            txid = tx.get("txid", "")
+            vins = tx.get("vin", [])
 
-            for vin_idx, txin in enumerate(inputs):
-                script = txin.get("script", "")
-                pubkey = extract_pubkey_from_scriptsig(script)
-                parsed = parse_der_sig_from_scriptsig(script)
+            for vin_idx, txin in enumerate(vins):
+                parsed = None
+                pubkey = None
+                sighash_flag = 1
+
+                witness = txin.get("witness", [])
+                if witness:
+                    # SegWit
+                    if len(witness) >= 2:
+                        sig_hex = witness[0]
+                        pubkey = witness[1]
+                        parsed = parse_der_sig_from_hex(sig_hex)
+                else:
+                    # Legacy
+                    scriptsig = txin.get("scriptsig", {})
+                    script_hex = scriptsig.get("hex", "") if isinstance(scriptsig, dict) else txin.get("scriptsig", "")
+                    if script_hex:
+                        pubkey = extract_pubkey_from_scriptsig(script_hex)
+                        parsed = parse_der_sig_from_hex(script_hex)  # Reuse for legacy too, as it finds the DER
+
                 if not parsed:
                     continue
 
                 r, s, sighash_flag = parsed
 
-                # --- ✅ Compute real z (message hash) ---
-                try:
-                    rawtx = tx.get("raw", None)
-                    if rawtx:
-                        raw_bytes = bytes.fromhex(rawtx)
-                        # For now assume legacy sighash (SIGHASH_ALL).
-                        # If you want BIP143 (segwit) support, need branch here.
-                        tx_copy = raw_bytes + sighash_flag.to_bytes(4, "little")
-                        z_val = int(sha256(sha256(tx_copy).digest()).hexdigest(), 16)
-                    else:
-                        z_val = None
-                except Exception as e:
-                    print(f"[warn] could not compute z for txid={txid}: {e}")
-                    z_val = None
+                # Compute real z
+                z_val = compute_sighash_z(tx, vin_idx, sighash_flag)
 
                 sigs.append({
                     "txid": txid,
@@ -338,7 +450,7 @@ def extract_signatures(transactions: List[dict]) -> List[Dict[str, Any]]:
                     "s": s,
                     "sighash": sighash_flag,
                     "pubkey": pubkey,
-                    "z_original": z_val   # ✅ real computed z
+                    "z_original": z_val
                 })
         except Exception as e:
             print(f"[warn] extract_signatures error: {e}")
@@ -373,369 +485,18 @@ def check_reused_nonce_global(this_address: str, signatures: List[Dict[str, Any]
                     "r": hex(r_val),
                     "occurrences": occ,
                     "risk": "Multiple signatures share identical r (strong vulnerability).",
-                    "action": "Rotate keys; cease signing with affected key. Investigate wallet RNG.",
-                    "note": "z shown is SHA256(txid) surrogate, NOT the real ECDSA preimage hash."
+                    "action": "Rotate keys; cease signing with affected key. Investigate wallet RNG."
                 })
     return results
 
-def classify_rng_weak(unique_r: int, total: int) -> Optional[str]:
-    if total < 8:
-        return None
-    ratio = unique_r / total if total else 1.0
-    if total >= 20 and ratio < WEAK_R_RATIO_STRONG:
-        return "strong"
-    if total >= 12 and ratio < WEAK_R_RATIO_MEDIUM:
-        return "medium"
-    return None
-
-def check_weak_rng(signatures: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if len(signatures) < 8:
-        return None
-    r_values = [s['r'] for s in signatures]
-    unique_r = len(set(r_values))
-    sev = classify_rng_weak(unique_r, len(r_values))
-    if not sev:
-        return None
-    ratio = unique_r / len(r_values)
-    return {
-        "type": "Weak RNG",
-        "unique_r": unique_r,
-        "total": len(r_values),
-        "ratio": ratio,
-        "severity": sev,
-        "signal": "Low r diversity across signatures.",
-        "note": "Heuristic signal; confirm RNG health."
-    }
-
-def check_multi_nonce_delta(signatures: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if len(signatures) < 12:
-        return None
-    r_vals = [s["r"] for s in signatures]
-    deltas = [abs(r_vals[i] - r_vals[i-1]) for i in range(1, len(r_vals))]
-    if not deltas:
-        return None
-    uniq = len(set(deltas))
-    ratio = uniq / len(deltas)
-    severity = None
-    if len(deltas) >= 20 and ratio < DELTA_RATIO_STRONG:
-        severity = "strong"
-    elif len(deltas) >= 12 and ratio < DELTA_RATIO_MEDIUM:
-        severity = "medium"
-    if not severity:
-        return None
-    return {
-        "type": "Multi-Nonce Delta",
-        "unique_deltas": uniq,
-        "total_deltas": len(deltas),
-        "ratio": ratio,
-        "severity": severity,
-        "signal": "Structured spacing in r suggests nonce patterning.",
-    }
-
-def chi2_pvalue_from_counts(counts: List[int]) -> float:
-    # simple χ² GOF assuming equal expected
-    import math
-    k = len(counts)
-    if k == 0:
-        return 1.0
-    n = sum(counts)
-    if n == 0:
-        return 1.0
-    exp = n / k
-    chi2 = sum((c - exp) ** 2 / exp for c in counts)
-    # approximate p with survival function using dof = k-1
-    # simple series approx (for small k ok); if scipy unavailable
-    # Wilson-Hilferty transform
-    df = k - 1
-    if df <= 0:
-        return 1.0
-    t = (chi2/df)**(1/3) - (1 - 2/(9*df))
-    z = t / math.sqrt(2/(9*df))
-    # 1 - Phi(z)
-    return 0.5 * math.erfc(z / math.sqrt(2))
-
-def check_kvalue_signals(signatures: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    s_vals = [s.get("s") for s in signatures if isinstance(s.get("s"), int)]
-    n = len(s_vals)
-    if n < KVALUE_MIN_SIGS_MEDIUM:
-        return None
-
-    s_sorted = sorted(s_vals)
-    med = s_sorted[n // 2]
-    hi = sum(1 for x in s_vals if x > med)
-    lo = n - hi
-    bias = abs(hi - lo) / n if n > 0 else 0.0
-
-    gcd_all = 0
-    for x in s_vals:
-        gcd_all = math.gcd(gcd_all, x)
-        if gcd_all == 1:
-            break
-
-    # mod-prime chi2 (weak-but-useful heuristic)
-    primes = [3, 5, 7, 11]
-    chi2_pvals = {}
-    for p in primes:
-        bucket = [0]*p
-        for x in s_vals:
-            bucket[x % p] += 1
-        chi2_pvals[p] = chi2_pvalue_from_counts(bucket)
-    chi2_flag = any(pv < 0.05 for pv in chi2_pvals.values())
-
-    # Evidence classification
-    level = "weak"
-    notes = []
-    if gcd_all > 1 or (bias >= KVALUE_BIAS_THRESHOLD_STRONG and n >= KVALUE_MIN_SIGS_STRONG):
-        level = "strong"
-    elif (bias >= KVALUE_BIAS_THRESHOLD_MEDIUM and n >= KVALUE_MIN_SIGS_MEDIUM) or chi2_flag:
-        level = "medium"
-    else:
-        level = "weak"
-
-    if bias >= KVALUE_BIAS_THRESHOLD_MEDIUM:
-        notes.append("Non-uniform s distribution (median-split bias).")
-    if gcd_all > 1:
-        notes.append(f"s values share a common factor {gcd_all}.")
-    if chi2_flag:
-        notes.append("Residue bias across small primes (χ²).")
-
-    if level == "weak":
-        return None
-
-    return {
-        "type": "K-Value Signals",
-        "notes": notes,
-        "disclaimer": "Signals are heuristic and NOT a key-recovery. Review RNG & signer.",
-        "gcd": (gcd_all if gcd_all > 1 else None),
-        "bias": bias,
-        "sample_size": n,
-        "evidence_level": level,
-        "chi2_mod_primes": chi2_pvals
-    }
-
-# -------------------- Deep analysis --------------------
-def deep_analyse(signatures: List[Dict[str, Any]]) -> Dict[str, Any]:
-    stats: Dict[str, Any] = {}
-    total = len(signatures)
-    stats["total_signatures"] = total
-    if total == 0:
-        return stats
-
-    r_vals = [s["r"] for s in signatures]
-    s_vals = [s["s"] for s in signatures]
-    sighashes = [s.get("sighash", 1) for s in signatures]
-
-    stats["unique_r"] = len(set(r_vals))
-    stats["repeated_r_count"] = total - stats["unique_r"]
-
-    r_counts = Counter(r_vals)
-    top_r = r_counts.most_common(5)
-    stats["top_r"] = [{"r": hex(r), "count": c} for (r, c) in top_r if c > 1]
-
-    sh_counts = Counter(sighashes)
-    stats["sighash_distribution"] = [{"flag": k, "count": v} for k, v in sorted(sh_counts.items())]
-
-    s_sorted = sorted(s_vals)
-    s_median = s_sorted[len(s_sorted)//2]
-    stats["s_median_hex"] = hex(s_median)
-    low_s = sum(1 for x in s_vals if x <= N//2)
-    high_s = total - low_s
-    stats["low_s_fraction"] = round(low_s / total, 4)
-    stats["high_s_fraction"] = round(high_s / total, 4)
-
-    gcd_all = 0
-    for x in s_vals:
-        gcd_all = math.gcd(gcd_all, x)
-        if gcd_all == 1:
-            break
-    stats["gcd_s"] = gcd_all
-
-    bits = [s.bit_length() for s in s_vals]
-    bits_sorted = sorted(bits)
-    stats["s_bits_min"] = min(bits)
-    stats["s_bits_med"] = bits_sorted[len(bits_sorted)//2]
-    stats["s_bits_max"] = max(bits)
-
-    # NEW: deeper stats
-    # stddev of bit lengths
-    mean_bits = sum(bits)/len(bits)
-    stats["s_bits_std"] = (sum((b-mean_bits)**2 for b in bits)/len(bits))**0.5
-
-    # even/odd and LSB runs test
-    evens = sum(1 for x in s_vals if (x & 1) == 0)
-    odds = total - evens
-    stats["s_even_fraction"] = round(evens/total, 4)
-    stats["s_odd_fraction"] = round(odds/total, 4)
-
-    lsb_seq = [x & 1 for x in s_vals]
-    runs = 1 + sum(1 for i in range(1, len(lsb_seq)) if lsb_seq[i] != lsb_seq[i-1])
-    # Wald–Wolfowitz runs z-score (approx)
-    n1, n0 = odds, evens
-    mu = (2*n1*n0)/(n1+n0) + 1 if (n1+n0)>0 else 0
-    var = (2*n1*n0*(2*n1*n0 - n1 - n0))/(((n1+n0)**2)*(n1+n0-1)) if (n1+n0)>1 else 1
-    z_runs = (runs - mu)/math.sqrt(var) if var>0 else 0.0
-    stats["lsb_runs_count"] = runs
-    stats["lsb_runs_z"] = round(z_runs, 3)
-
-    # serial correlation (Pearson) for successive s
-    if len(s_vals) >= 3:
-        x = s_vals
-        xm = sum(x)/len(x)
-        num = sum((x[i]-xm)*(x[i-1]-xm) for i in range(1, len(x)))
-        den = sum((xi - xm)**2 for xi in x)
-        stats["serial_corr"] = round(num/den, 4) if den else 0.0
-    else:
-        stats["serial_corr"] = None
-
-    # very light Spearman rho (rank correlation with index)
-    if len(s_vals) >= 5:
-        ranks = {v:i for i, v in enumerate(sorted(set(s_vals)))}
-        r = [ranks[v] for v in s_vals]
-        n = len(r)
-        d2 = sum((r[i] - i)**2 for i in range(n))
-        stats["spearman_rho"] = round(1 - (6*d2)/(n*(n*n - 1)), 4) if n>2 else None
-    else:
-        stats["spearman_rho"] = None
-
-    # entropy of top-12 bits
-    def entropy(vals):
-        from collections import Counter
-        cnt = Counter(vals)
-        n = sum(cnt.values())
-        import math
-        return -sum((c/n)*math.log2(c/n) for c in cnt.values() if c>0)
-    hi12 = [(s >> (s.bit_length() - 12)) & ((1<<12)-1) for s in s_vals if s.bit_length() >= 12]
-    stats["entropy_hi12"] = round(entropy(hi12), 3) if hi12 else None
-
-    # χ² over small primes
-    primes = [3,5,7,11]
-    chi2_pvals = {}
-    for p in primes:
-        bucket = [0]*p
-        for x in s_vals:
-            bucket[x % p] += 1
-        chi2_pvals[p] = chi2_pvalue_from_counts(bucket)
-    stats["chi2_mod_primes"] = {p: round(v, 4) for p, v in chi2_pvals.items()}
-
-    return stats
-
 # -------------------- Reporting --------------------
-def save_report_txt(address: str, report: Dict[str, Any]) -> bool:
-    os.makedirs("reports", exist_ok=True)
-
-    vulns = report.get("vulnerabilities", [])
-    if not vulns:
-        print(f"[skip] {address}: clean (no anomalies)")
-        return False
-
-    # Only-KValue case gate
-    only_kvalue = (len(vulns) == 1 and vulns[0].get("type") == "K-Value Signals")
-    if only_kvalue:
-        ksig = vulns[0]
-        level = ksig.get("evidence_level", "weak")
-        n = ksig.get("sample_size", 0)
-        if level == "strong" and n >= KVALUE_MIN_SIGS_STRONG:
-            pass
-        elif level == "medium" and n >= KVALUE_MIN_SIGS_MEDIUM:
-            pass
-        else:
-            print(f"[skip] {address}: K-Value evidence not enough (level={level}, n={n})")
-            return False
-
-    txt_path = os.path.join("reports", f"{address}_report.txt")
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("=" * 80 + "\n")
-        f.write("CRYPTOGRAPHYTUBE Bitcoin Vulnerability Report (SAFE MODE)\n")
-        f.write("=" * 80 + "\n")
-        f.write(f"Scan Time: {report['scan_time']}\n")
-        f.write(f"Address: {address}\n")
-        f.write(f"Total Transactions: {report.get('transaction_count', 0)}\n")
-        f.write(f"Signatures Analyzed: {report.get('signature_count', 0)}\n")
-        f.write("=" * 80 + "\n\n")
-
-        for i, v in enumerate(vulns, 1):
-            f.write(f"🔴 VULNERABILITY #{i}: {v['type']}\n")
-            f.write("-" * 80 + "\n")
-
-            if v["type"] == "Reused Nonce":
-                r_no0x = v["r"][2:] if isinstance(v.get("r"), str) and v["r"].startswith("0x") else str(v.get("r"))
-                f.write(f"r: {r_no0x}\n")
-                f.write(f"{v['risk']}\n")
-                f.write("Occurrences:\n")
-                for j, occ in enumerate(v["occurrences"], 1):
-                    pk = occ.get("pubkey") or "N/A"
-                    f.write(f" {j}. txid={occ['txid']} pubkey={pk}\n")
-                f.write(f"Action: {v['action']}\n")
-                f.write(f"Note: {v.get('note','')}\n")
-
-            elif v["type"] == "Weak RNG":
-                f.write(f"Unique r: {v['unique_r']}/{v['total']}  (ratio={v['ratio']:.2f})\n")
-                if v.get("severity"):
-                    f.write(f"Severity: {v['severity']}\n")
-                f.write(f"Signal: {v['signal']}\n")
-                f.write(f"Note: {v['note']}\n")
-
-            elif v["type"] == "Multi-Nonce Delta":
-                f.write(f"Unique deltas: {v['unique_deltas']}/{v['total_deltas']}  (ratio={v['ratio']:.2f})\n")
-                if v.get("severity"):
-                    f.write(f"Severity: {v['severity']}\n")
-                f.write(f"Signal: {v['signal']}\n")
-
-            elif v["type"] == "K-Value Signals":
-                f.write(f"Evidence level: {v.get('evidence_level','unknown')}  (n={v.get('sample_size','?')})\n")
-                f.write("Signals:\n")
-                for note in v.get("notes", []):
-                    f.write(f" - {note}\n")
-                if v.get("gcd"):
-                    f.write(f"GCD(s): {v['gcd']}\n")
-                if v.get("chi2_mod_primes"):
-                    f.write("χ² mod primes p-values: " + ", ".join(f"p{p}≈{pv:.4f}" for p, pv in v["chi2_mod_primes"].items()) + "\n")
-                f.write(f"Bias (median split): {v.get('bias',0):.3f}\n")
-                f.write(f"Disclaimer: {v.get('disclaimer','')}\n")
-
-                # 🔹 NEW: full deep analysis dump
-                da = report.get("deep_analysis", {})
-                if da:
-                    f.write("\n--- Detailed K-Value Metrics ---\n")
-                    f.write(f"s_bits: min={da.get('s_bits_min')} med={da.get('s_bits_med')} max={da.get('s_bits_max')} std={da.get('s_bits_std')}\n")
-                    f.write(f"s_low_fraction: {da.get('low_s_fraction')}  s_high_fraction: {da.get('high_s_fraction')}\n")
-                    f.write(f"even/odd fraction: even={da.get('s_even_fraction')}  odd={da.get('s_odd_fraction')}\n")
-                    f.write(f"LSB runs: count={da.get('lsb_runs_count')}  z_score={da.get('lsb_runs_z')}\n")
-                    f.write(f"serial_corr: {da.get('serial_corr')}\n")
-                    f.write(f"spearman_rho: {da.get('spearman_rho')}\n")
-                    f.write(f"entropy_hi12: {da.get('entropy_hi12')}\n")
-                    if da.get("chi2_mod_primes"):
-                        f.write("chi2_mod_primes: " + ", ".join(f"p{p}≈{pv}" for p, pv in da["chi2_mod_primes"].items()) + "\n")
-
-            f.write("\n")
-
-        # Deep analysis summary always included
-        da = report.get("deep_analysis", {})
-        f.write("=" * 80 + "\n")
-        f.write("Deep Analysis\n")
-        f.write("=" * 80 + "\n")
-        for k in [
-            "total_signatures","unique_r","repeated_r_count","s_median_hex",
-            "low_s_fraction","high_s_fraction","gcd_s","s_bits_min",
-            "s_bits_med","s_bits_max","s_bits_std","s_even_fraction",
-            "s_odd_fraction","lsb_runs_count","lsb_runs_z","serial_corr",
-            "spearman_rho","entropy_hi12"
-        ]:
-            if k in da:
-                f.write(f"{k}: {da[k]}\n")
-        if "chi2_mod_primes" in da:
-            f.write("chi2_mod_primes: " + ", ".join(f"p{p}≈{pv}" for p, pv in da["chi2_mod_primes"].items()) + "\n")
-
-    print(f"[saved] {address} → {txt_path}")
-    return True
-
 def save_rnonce(vulns: List[Dict[str, Any]], address: str):
     if not vulns:
         return
     for v in vulns:
         if v["type"] != "Reused Nonce":
             continue
-        r_hex = v["r"][2:] if isinstance(v.get("r"), str) and v["r"].startswith("0x") else str(v.get("r"))
+        r_hex = v["r"][2:] if isinstance(v.get("r"), str) and v["r"].startswith("0x") else str(hex(int(v.get("r")))[2:])
         for occ in v["occurrences"]:
             txid = occ.get("txid") or "N/A"
             pk = occ.get("pubkey") or "N/A"
@@ -744,8 +505,8 @@ def save_rnonce(vulns: List[Dict[str, Any]], address: str):
                 SAVED_R_GROUPS[r_hex].append(key)
 
     os.makedirs("reports", exist_ok=True)
-    path = os.path.join("report", "rnonce.txt")
-    with open(path, "w", encoding="utf-8") as f:
+    path_rnonce = os.path.join("reports", "rnonce.txt")
+    with open(path_rnonce, "w", encoding="utf-8") as f:
         for r_hex, occ_list in SAVED_R_GROUPS.items():
             f.write("=" * 80 + "\n")
             f.write("Reused Nonce Group\n")
@@ -756,185 +517,39 @@ def save_rnonce(vulns: List[Dict[str, Any]], address: str):
                 txid, pk = key.split("|")
                 f.write(f" - txid={txid} pubkey={pk}\n")
             f.write("\n")
-    print(f"[updated] rnonce groups saved → {path}")
+    print(f"[updated] rnonce groups saved → {path_rnonce}")
 
-def save_address_vulns(address: str, vulns: List[Dict[str, Any]]):
-    if not vulns:
-        return
-    selected = [v for v in vulns if v["type"] in ("Weak RNG", "Multi-Nonce Delta")]
-    if not selected:
-        return
-
-    os.makedirs("reports", exist_ok=True)
-    path = os.path.join("reports", f"{address}_vulns.txt")
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("="*80 + "\n")
-        f.write(f"Address: {address}\n")
-        f.write(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("="*80 + "\n\n")
-
-        for v in selected:
-            f.write(f"🔴 {v['type']}\n")
-            f.write("-"*80 + "\n")
-            if v["type"] == "Weak RNG":
-                f.write(f"Unique r: {v['unique_r']}/{v['total']}  (ratio={v['ratio']:.2f})\n")
-                f.write(f"Severity: {v.get('severity','')}\n")
-                f.write(f"Signal: {v['signal']}\n")
-            elif v["type"] == "Multi-Nonce Delta":
-                f.write(f"Unique deltas: {v['unique_deltas']}/{v['total_deltas']}  (ratio={v['ratio']:.2f})\n")
-                f.write(f"Severity: {v.get('severity','')}\n")
-                f.write(f"Signal: {v['signal']}\n")
+    # Save rnon.txt with s, z, pubkey in hex
+    path_rnon = os.path.join("reports", "rnon.txt")
+    with open(path_rnon, "w", encoding="utf-8") as f:
+        for r_hex, _ in list(SAVED_R_GROUPS.items()):
+            r_int = int(r_hex, 16)
+            group = GLOBAL_R_MAP.get(r_int, [])
+            if len(group) < 2:
+                continue
+            f.write("=" * 80 + "\n")
+            f.write("Reused Nonce Group\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"r: {r_hex}\n")
+            f.write("Occurrences:\n")
+            seen = set()
+            for item in group:
+                txid = item.get("txid", "N/A")
+                s_val = item.get("s", "N/A")
+                if isinstance(s_val, int):
+                    s_hex = hex(s_val)[2:]
+                else:
+                    s_hex = str(s_val)
+                z_val = item.get("z_original")
+                z_hex = hex(z_val)[2:] if z_val is not None else "N/A"
+                pk = item.get("pubkey", "N/A")
+                key = (txid, pk)
+                if key in seen:
+                    continue
+                seen.add(key)
+                f.write(f" - txid={txid} s={s_hex} z={z_hex} pubkey={pk}\n")
             f.write("\n")
-
-    print(f"[saved] {address} → {path}")
-
-
-def save_kvalue_consolidated():
-    """
-    Atomic write of consolidated K-Value summary to report/kvalue.txt.
-    Order: r_values -> s_values -> z_values -> txids
-    """
-    global KVALUE_CONSOLIDATED
-    os.makedirs("report", exist_ok=True)
-    path = os.path.join("report", "kvalue.txt")
-    tmp_path = path + ".tmp"
-
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write("=== Consolidated K-Value Summary ===\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Entries: {len(KVALUE_CONSOLIDATED)}\n\n")
-
-            if not KVALUE_CONSOLIDATED:
-                f.write("(No K-Value entries collected)\n")
-
-            for row in KVALUE_CONSOLIDATED:
-                addr = row.get("address", "N/A")
-                f.write(f"[Address] {addr}\n")
-                f.write(f"  Evidence level: {row.get('level', 'unknown')}\n")
-                f.write(f"  Signatures analyzed: {row.get('n', 0)}\n")
-                bias = row.get('bias', 0.0)
-                f.write(f"  Bias (median split): {bias:.6f}\n")
-                gcds = row.get('gcd') or 1
-                f.write(f"  GCD(s): {gcds}\n")
-
-                # deep metrics
-                da = row.get("deep", {}) or {}
-                if da:
-                    f.write(f"  s_bits: min={da.get('s_bits_min')} med={da.get('s_bits_med')} "
-                            f"max={da.get('s_bits_max')} std={da.get('s_bits_std')}\n")
-                    f.write(f"  s_low_fraction: {da.get('low_s_fraction')}  "
-                            f"s_high_fraction: {da.get('high_s_fraction')}\n")
-                    f.write(f"  even/odd fraction: even={da.get('s_even_fraction')} "
-                            f"odd={da.get('s_odd_fraction')}\n")
-                    f.write(f"  LSB runs: count={da.get('lsb_runs_count')} "
-                            f"z_score={da.get('lsb_runs_z')}\n")
-                    if da.get("serial_corr") is not None:
-                        f.write(f"  serial_corr: {da.get('serial_corr')}\n")
-                    if da.get("spearman_rho") is not None:
-                        f.write(f"  spearman_rho: {da.get('spearman_rho')}\n")
-                    if da.get("entropy_hi12") is not None:
-                        f.write(f"  entropy_hi12: {da.get('entropy_hi12')}\n")
-                    if da.get("chi2_mod_primes"):
-                        f.write("  chi2_mod_primes: " +
-                                ", ".join(f"p{p}≈{pv:.6f}" for p, pv in da["chi2_mod_primes"].items()) + "\n")
-
-                # notes
-                if row.get("notes"):
-                    f.write("  Notes:\n")
-                    for nt in row.get("notes", []):
-                        f.write(f"    - {nt}\n")
-
-                # r_values
-                r_list = row.get("r_values", [])
-                f.write("  r_values (decimal) [count=%d]:\n" % len(r_list))
-                for r in r_list:
-                    f.write(f"    {r}\n")
-
-                # s_values
-                s_list = row.get("s_values", [])
-                f.write("  s_values (decimal) [count=%d]:\n" % len(s_list))
-                for s in s_list:
-                    f.write(f"    {s}\n")
-
-                # z_values
-                z_list = row.get("z_values", [])
-                f.write("  z_values (decimal) [count=%d]:\n" % len(z_list))
-                for z in z_list:
-                    f.write(f"    {z}\n")
-
-                # txids
-                txids = row.get("txids", [])
-                f.write("  txids [count=%d]:\n" % len(txids))
-                for t in txids:
-                    f.write(f"    {t}\n")
-                
-                # pubkey_values
-                pubkey_list = row.get("pubkey_values", [])
-                f.write("  pubkey_values (hex) [count=%d]:\n" % len(pubkey_list))
-                for pk in pubkey_list:
-                    f.write(f"    {pk}\n")
-
-
-                f.write("\n")
-
-        # atomic replace
-        os.replace(tmp_path, path)
-        print(f"[saved] consolidated K-Value -> {os.path.abspath(path)} "
-              f"(entries={len(KVALUE_CONSOLIDATED)})")
-
-    except Exception as e:
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-        raise
-
-def save_cross_address_summary():
-    """Optional summary for reused-r across addresses."""
-    if not SAVED_R_GROUPS:
-        return
-    os.makedirs("reports", exist_ok=True)
-    path = os.path.join("reports", "cross_reused_r_summary.txt")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("Cross-Address Reused-r Summary\n")
-        f.write("="*80 + "\n")
-        for r_hex, occ in SAVED_R_GROUPS.items():
-            f.write(f"r={r_hex}  occurrences={len(occ)}\n")
-    print(f"[saved] cross-address summary → {path}")
-
-def save_address_vulns(address: str, vulns: List[Dict[str, Any]]):
-    if not vulns:
-        return
-    selected = [v for v in vulns if v["type"] in ("Weak RNG", "Multi-Nonce Delta")]
-    if not selected:
-        return
-
-    os.makedirs("reports", exist_ok=True)
-    path = os.path.join("reports", f"{address}_vulns.txt")
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("="*80 + "\n")
-        f.write(f"Address: {address}\n")
-        f.write(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("="*80 + "\n\n")
-
-        for v in selected:
-            f.write(f"🔴 {v['type']}\n")
-            f.write("-"*80 + "\n")
-            if v["type"] == "Weak RNG":
-                f.write(f"Unique r: {v['unique_r']}/{v['total']}  (ratio={v['ratio']:.2f})\n")
-                f.write(f"Severity: {v.get('severity','')}\n")
-                f.write(f"Signal: {v['signal']}\n")
-            elif v["type"] == "Multi-Nonce Delta":
-                f.write(f"Unique deltas: {v['unique_deltas']}/{v['total_deltas']}  (ratio={v['ratio']:.2f})\n")
-                f.write(f"Severity: {v.get('severity','')}\n")
-                f.write(f"Signal: {v['signal']}\n")
-            f.write("\n")
-
-    print(f"[saved] {address} → {path}")
+    print(f"[updated] rnon groups saved → {path_rnon}")
 
 # -------------------- Driver --------------------
 
@@ -951,113 +566,49 @@ def analyze_address(address: str) -> Optional[Dict[str, Any]]:
         "transaction_count": 0,
         "signature_count": 0,
         "vulnerabilities": [],
-        "per_address_counts": {},
-        "deep_analysis": {},
     }
 
-    # 🔹 fetch all transactions
+    # fetch all transactions with retries
     txs = fetch_all_transactions(address)
     report["transaction_count"] = len(txs)
 
-    # 🔹 extract signatures
+    # extract signatures
     sigs = extract_signatures(txs)
     report["signature_count"] = len(sigs)
+    print(f"Extracted {len(sigs)} signatures from {len(txs)} txs")
 
-    # 🔹 push to GLOBAL_R_MAP
+    # push to GLOBAL_R_MAP
     for g in sigs:
         GLOBAL_R_MAP[g["r"]].append({
             "address": address,
             "txid": g.get("txid", ""),
-            "pubkey": g.get("pubkey")
+            "pubkey": g.get("pubkey"),
+            "s": g["s"],
+            "z_original": g["z_original"]
         })
-
-    # 🔹 deep analysis
-    da = deep_analyse(sigs)
-    report["deep_analysis"] = da
 
     vulns: List[Dict[str, Any]] = []
 
-    # ---------------- Vulnerability checks ----------------
-    # Reused nonce (हमेशा check होगा)
+    # Reused nonce check
     reused = check_reused_nonce_global(address, sigs)
     if reused:
         vulns.extend(reused)
         VULN_COUNTS["Reused Nonce"] += len(reused)
-        report["per_address_counts"]["Reused Nonce"] = len(reused)
-    else:
-        report["per_address_counts"]["Reused Nonce"] = 0
+        print(f"Found {len(reused)} reused nonce groups for {address}")
 
-    # Weak RNG
-    weak = check_weak_rng(sigs)
-    if weak:
-        vulns.append(weak)
-        VULN_COUNTS["Weak RNG"] += 1
-        report["per_address_counts"]["Weak RNG"] = 1
-    else:
-        report["per_address_counts"]["Weak RNG"] = 0
-
-    # Multi-nonce delta
-    delta = check_multi_nonce_delta(sigs)
-    if delta:
-        vulns.append(delta)
-        VULN_COUNTS["Multi-Nonce Delta"] += 1
-        report["per_address_counts"]["Multi-Nonce Delta"] = 1
-    else:
-        report["per_address_counts"]["Multi-Nonce Delta"] = 0
-
-    # K-value signals
-    ksig = check_kvalue_signals(sigs)
-    if ksig:
-        vulns.append(ksig)
-        VULN_COUNTS["K-Value Signals"] += 1
-        report["per_address_counts"]["K-Value Signals"] = 1
-
-        # ✅ Collect r, s, z (original), txids, and pubkeys
-        r_list = [item.get("r") for item in sigs if isinstance(item.get("r"), int)]
-        s_list = [item.get("s") for item in sigs if isinstance(item.get("s"), int)]
-        z_list = [item.get("z_original") for item in sigs if item.get("z_original") is not None]
-        txids = [item.get("txid") for item in sigs if item.get("txid")]
-        txids = list(dict.fromkeys(txids))  # unique txids
-        pubkey_list = [item.get("pubkey") for item in sigs if item.get("pubkey") is not None]
-
-        # Append consolidated
-        KVALUE_CONSOLIDATED.append({
-            "address": address,
-            "n": ksig.get("sample_size"),
-            "level": ksig.get("evidence_level"),
-            "bias": ksig.get("bias", 0.0),
-            "gcd": ksig.get("gcd"),
-            "notes": ksig.get("notes", []),
-            "deep": da,
-            "r_values": r_list,
-            "s_values": s_list,
-            "z_values": z_list,   
-            "txids": txids,
-            "pubkey_values": pubkey_list  # ✅ public key save होगा
-        })
-
-        print(f"[info] K-Value appended for {address} "
-              f"(level={ksig.get('evidence_level')}, n={ksig.get('sample_size')})")
-
-        # Save immediately if toggle is on
-        if SAVE_KVALUE_IMMEDIATE:
-            try:
-                save_kvalue_consolidated()
-            except Exception as e:
-                print(f"[error] save_kvalue_consolidated() failed: {e}")
-    else:
-        report["per_address_counts"]["K-Value Signals"] = 0
-
-    # ---------------- Mark vulnerable ----------------
+    # Mark vulnerable
     if vulns:
         VULNERABLE_ADDRESSES += 1
         report["vulnerabilities"] = vulns
 
     REPORTS.append(report)
 
-    # Save reports (reused nonce report हमेशा चलेगा)
+    # Save rnonce and rnon
     save_rnonce(vulns, address)
-    save_address_vulns(address, vulns)
+
+    # Increased delay between addresses to respect rate limits
+    print(f"[delay] 3s pause after {address}")
+    time.sleep(3)
 
     return report
 
@@ -1080,7 +631,7 @@ def get_transaction_limit() -> int:
         print("Please enter a valid non-negative integer.")
 
 def main():
-    global TOTAL_ADDRESSES, MAX_TRANSACTIONS, SAVE_KVALUE_FLAG
+    global TOTAL_ADDRESSES, MAX_TRANSACTIONS
     try:
         addr_file = get_input_file()
         MAX_TRANSACTIONS = get_transaction_limit()
@@ -1088,17 +639,13 @@ def main():
             addresses = [ln.strip() for ln in f if ln.strip()]
         TOTAL_ADDRESSES = len(addresses)
 
-        print("\nAll transaction data will be fetched for all checks (K-Value, Reused Nonce, etc.).")
-        
-        SAVE_KVALUE_FLAG = True
+        print("\nAll transaction data will be fetched for reused nonce checks.")
+        print("Improved rate limit handling: retries, backoffs, and increased delays.")
 
         for addr in addresses:
             if EXIT_FLAG:
                 break
             analyze_address(addr)
-
-        if not EXIT_FLAG:
-            save_kvalue_consolidated()
 
         if not EXIT_FLAG:
             print("\nScanning completed!")
@@ -1107,7 +654,7 @@ def main():
             for rep in REPORTS:
                 if rep.get("vulnerabilities"):
                     print(f" - {rep['address']}")
-            print("\nTXT reports saved in 'report/rnonce.txt', 'reports/[address]_vulns.txt', and consolidated K-Value in 'report/kvalue.txt'.")
+            print("\nReused nonce groups saved in 'reports/rnonce.txt' and 'reports/rnon.txt'.")
     except KeyboardInterrupt:
         sys.exit(0)
 
